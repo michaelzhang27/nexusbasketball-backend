@@ -31,8 +31,10 @@ from db import (
 # ── Paths ──────────────────────────────────────────────────────────────────────
 # CSVs now live alongside the backend in backend/players/
 BASE_DIR = Path(__file__).parent / "players"
-ALL_PLAYERS_CSV = BASE_DIR / "all_players.csv"
-TRANSFERS_CSV   = BASE_DIR / "transfers.csv"
+ALL_PLAYERS_CSV        = BASE_DIR / "all_players.csv"
+TRANSFERS_CSV          = BASE_DIR / "transfers.csv"
+WOMENS_ALL_PLAYERS_CSV = BASE_DIR / "womens_all_players.csv"
+WOMENS_TRANSFERS_CSV   = BASE_DIR / "womens_transfers.csv"
 PREDICTOR_DIR        = Path(__file__).parent / "player-stat-predictor"
 TEAM_PREDICTOR_DIR   = Path(__file__).parent / "team-record-predictor"
 
@@ -671,12 +673,12 @@ def nil_estimate(ppg: float, position: str) -> list[int]:
 
 
 # ── CSV loading ────────────────────────────────────────────────────────────────
-def load_transfer_ids() -> set[str]:
-    """Return the set of athlete_ids found in transfers.csv."""
+def load_transfer_ids(csv_path: Path = TRANSFERS_CSV) -> set[str]:
+    """Return the set of athlete_ids found in a transfers CSV."""
     ids: set[str] = set()
-    if not TRANSFERS_CSV.exists():
+    if not csv_path.exists():
         return ids
-    with open(TRANSFERS_CSV, newline="", encoding="utf-8") as f:
+    with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             aid = row.get("athlete_id", "").strip()
@@ -684,14 +686,17 @@ def load_transfer_ids() -> set[str]:
                 ids.add(aid)
     return ids
 
-def load_players() -> list[Player]:
-    if not ALL_PLAYERS_CSV.exists():
+def load_players(
+    players_csv: Path = ALL_PLAYERS_CSV,
+    transfers_csv: Path = TRANSFERS_CSV,
+) -> list[Player]:
+    if not players_csv.exists():
         return []
 
-    transfer_ids = load_transfer_ids()
+    transfer_ids = load_transfer_ids(transfers_csv)
     players: list[Player] = []
 
-    with open(ALL_PLAYERS_CSV, newline="", encoding="utf-8") as f:
+    with open(players_csv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             athlete_id = row.get("athlete_id", "").strip()
@@ -839,15 +844,25 @@ def load_players() -> list[Player]:
 
 
 # ── Load data at startup ───────────────────────────────────────────────────────
-_players_cache: list[Player] = []
+_mens_cache: list[Player] = []
+_womens_cache: list[Player] = []
+
+
+def _get_cache(gender: str) -> list[Player]:
+    return _womens_cache if gender == "womens" else _mens_cache
+
 
 @app.on_event("startup")
 async def startup_event():
-    global _players_cache
-    _players_cache = load_players()
-    transfer_ids = load_transfer_ids()
-    portal_count = sum(1 for p in _players_cache if p.id in transfer_ids)
-    print(f"Loaded {len(_players_cache)} players ({portal_count} in transfer portal)")
+    global _mens_cache, _womens_cache
+    _mens_cache = load_players()
+    _womens_cache = load_players(WOMENS_ALL_PLAYERS_CSV, WOMENS_TRANSFERS_CSV)
+    mens_transfer_ids = load_transfer_ids()
+    womens_transfer_ids = load_transfer_ids(WOMENS_TRANSFERS_CSV)
+    mens_portal = sum(1 for p in _mens_cache if p.id in mens_transfer_ids)
+    womens_portal = sum(1 for p in _womens_cache if p.id in womens_transfer_ids)
+    print(f"Loaded {len(_mens_cache)} men's players ({mens_portal} in transfer portal)")
+    print(f"Loaded {len(_womens_cache)} women's players ({womens_portal} in transfer portal)")
     try:
         _load_predictor()
         print(f"Predictor loaded from {PREDICTOR_DIR}")
@@ -862,14 +877,14 @@ async def startup_event():
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 @app.get("/api/players", response_model=list[Player])
-def get_players():
+def get_players(gender: str = Query("mens")):
     """Return all D1 players. Transfer portal players have portalEntryDate set."""
-    return _players_cache
+    return _get_cache(gender)
 
 @app.get("/api/players/transfers", response_model=list[Player])
-def get_transfers():
+def get_transfers(gender: str = Query("mens")):
     """Return only transfer portal players (subset of /api/players)."""
-    return [p for p in _players_cache if p.portalEntryDate != ""]
+    return [p for p in _get_cache(gender) if p.portalEntryDate != ""]
 
 @app.get("/api/players/search", response_model=SearchResult)
 def search_players(
@@ -890,12 +905,13 @@ def search_players(
     sort:  str = "ppg",         # ppg|rpg|apg|fg3Pct|efgPct|name|portalEntryDate
     offset: int = Query(0, ge=0),
     limit:  int = Query(48, ge=1, le=200),
+    gender: str = Query("mens"),
 ):
     """
     Server-side filtered + paginated player search.
     Used by the Explore page — returns a small batch instead of all 3k+ players.
     """
-    results = _players_cache
+    results = _get_cache(gender)
 
     # ── Text search ───────────────────────────────────────────────────────────
     if q:
@@ -1032,16 +1048,16 @@ def batch_predictions(request: BatchPredictionRequest):
 
 
 @app.get("/api/players/{player_id}", response_model=Player)
-def get_player(player_id: str):
+def get_player(player_id: str, gender: str = Query("mens")):
     from fastapi import HTTPException
-    player = next((p for p in _players_cache if p.id == player_id), None)
+    player = next((p for p in _get_cache(gender) if p.id == player_id), None)
     if not player:
         raise HTTPException(status_code=404, detail="Player not found")
     return player
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "players_loaded": len(_players_cache)}
+    return {"status": "ok", "mens_loaded": len(_mens_cache), "womens_loaded": len(_womens_cache)}
 
 
 # ── Team list endpoint ─────────────────────────────────────────────────────────
