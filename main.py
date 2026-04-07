@@ -125,6 +125,7 @@ class PlayerStats(BaseModel):
     orebPerGame: float = 0.0
     drebPerGame: float = 0.0
     foulsPerGame: float = 0.0
+    totalMinutes: float = 0.0  # season total minutes (general_minutes)
 
 class Player(PlayerStats):
     id: str
@@ -651,7 +652,7 @@ def compute_usage_pct(
     """Standard usage % = 100 * (FGA + 0.44*FTA + TOV) / (MP/TM_MP * (TM_FGA + 0.44*TM_FTA + TM_TOV))"""
     player_usage = fga + 0.44 * fta + tov
     team_usage = team_fga + 0.44 * team_fta + team_tov
-    if team_usage <= 0 or team_min <= 0:
+    if team_usage <= 0 or team_min <= 0 or player_min <= 0:
         return 0.0
     return round(100 * player_usage / (player_min / team_min * team_usage), 1)
 
@@ -720,7 +721,8 @@ def load_players(
             spg  = safe_float(row.get("defensive_avg_steals", "0"))
             bpg  = safe_float(row.get("defensive_avg_blocks", "0"))
             topg = safe_float(row.get("offensive_avg_turnovers", "0"))
-            mpg  = safe_float(row.get("general_avg_minutes", "0"))
+            mpg           = safe_float(row.get("general_avg_minutes", "0"))
+            total_minutes = safe_float(row.get("general_minutes", "0"))
             # Extra per-game fields for per-40 fit score computation
             fga_pg   = safe_float(row.get("offensive_avg_field_goals_attempted", "0"))
             fta_pg   = safe_float(row.get("offensive_avg_free_throws_attempted", "0"))
@@ -760,7 +762,7 @@ def load_players(
             team_plays   = team_fga + 0.44 * team_fta + team_tov
             usage = round(
                 100 * player_plays / (mpg / max(team_min, 1) * team_plays), 1
-            ) if team_plays > 0 and team_min > 0 else 0.0
+            ) if team_plays > 0 and team_min > 0 and mpg > 0 else 0.0
             usage = max(0.0, min(50.0, usage))
 
             # ── Advanced metrics ──────────────────────────────────────────────
@@ -831,6 +833,7 @@ def load_players(
                 orebPerGame=round(oreb_pg, 2),
                 drebPerGame=round(dreb_pg, 2),
                 foulsPerGame=round(fouls_pg, 2),
+                totalMinutes=round(total_minutes, 1),
             )
             players.append(player)
 
