@@ -103,3 +103,25 @@ create policy "Users can manage own models"
   on public.evaluation_models for all
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
+
+-- ── user_activity ─────────────────────────────────────────────────────────────
+-- Event log for tracking user actions (predictions, etc.) — append-only.
+-- Run this block in the Supabase SQL editor to enable activity tracking.
+create table if not exists public.user_activity (
+  id          uuid        primary key default uuid_generate_v4(),
+  user_id     uuid        not null references auth.users(id) on delete cascade,
+  event_type  text        not null,   -- 'prediction_run'
+  metadata    jsonb       not null default '{}',
+  created_at  timestamptz default now()
+);
+
+alter table public.user_activity enable row level security;
+
+-- Users can only insert their own activity rows (via service role from backend)
+create policy "Users can insert own activity"
+  on public.user_activity for insert
+  with check (auth.uid() = user_id);
+
+-- No select/update/delete for users — admin reads via service role
+create index if not exists user_activity_user_id_idx on public.user_activity(user_id);
+create index if not exists user_activity_event_type_idx on public.user_activity(event_type);

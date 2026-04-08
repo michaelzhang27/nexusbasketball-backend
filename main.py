@@ -1036,7 +1036,10 @@ def get_player_prediction(
 
 
 @app.post("/api/players/predictions/batch", response_model=list[PredictionResult])
-def batch_predictions(request: BatchPredictionRequest):
+def batch_predictions(
+    request: BatchPredictionRequest,
+    authorization: Optional[str] = Header(None),
+):
     if _predictor is None:
         raise HTTPException(status_code=503, detail="Predictor not available")
     results: list[PredictionResult] = []
@@ -1047,6 +1050,22 @@ def batch_predictions(request: BatchPredictionRequest):
         if not raw:
             continue
         results.append(_run_prediction(item.player_id, item.projected_mpg, raw))
+
+    # Log prediction run — never blocks predictions on failure
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        try:
+            sb = get_supabase()
+            resp = sb.auth.get_user(token)
+            if resp.user:
+                sb.table("user_activity").insert({
+                    "user_id":    str(resp.user.id),
+                    "event_type": "prediction_run",
+                    "metadata":   {"player_count": len(results)},
+                }).execute()
+        except Exception:
+            pass
+
     return results
 
 
@@ -1237,6 +1256,31 @@ def get_team_context(team_name: str):
     }
 
 
+# ── Analytics event logging ────────────────────────────────────────────────────
+
+class LogEventRequest(BaseModel):
+    event_type: str
+    metadata: dict = {}
+
+
+@app.post("/api/analytics/log-event")
+async def log_event(
+    body: LogEventRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Log a user activity event. Fire-and-forget from the frontend."""
+    try:
+        sb = get_supabase()
+        sb.table("user_activity").insert({
+            "user_id":    user_id,
+            "event_type": body.event_type,
+            "metadata":   body.metadata,
+        }).execute()
+    except Exception:
+        pass  # Never surface tracking errors to the user
+    return {"ok": True}
+
+
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
 
 class SignupRequest(BaseModel):
@@ -1361,8 +1405,11 @@ def get_analytics(x_analytics_key: str = Header(None)):
 
     for u in raw_users:
         meta = getattr(u, "user_metadata", {}) or {}
-        school = meta.get("school") or "Unknown"
-        conference = meta.get("conference") or "Unknown"
+        team_name = meta.get("team_name") or ""
+        # Derive school from team_name (it IS the school/team the coach belongs to)
+        school = team_name if team_name else "Unknown"
+        # Derive conference using the same CONFERENCE_MAP used for player data
+        conference = CONFERENCE_MAP.get(team_name, "Unknown") if team_name else "Unknown"
         users_by_school[school] = users_by_school.get(school, 0) + 1
         users_by_conference[conference] = users_by_conference.get(conference, 0) + 1
         user_details.append({
@@ -1371,7 +1418,7 @@ def get_analytics(x_analytics_key: str = Header(None)):
             "name":        meta.get("full_name", ""),
             "school":      school,
             "conference":  conference,
-            "team_name":   meta.get("team_name", ""),
+            "team_name":   team_name,
             "created_at":  str(getattr(u, "created_at", "")),
         })
 
@@ -1379,10 +1426,44 @@ def get_analytics(x_analytics_key: str = Header(None)):
     scenarios_resp = sb.table("scenarios").select("*").execute()
     scenarios = scenarios_resp.data or []
 
-    user_map = {u["id"]: u for u in user_details}
+    # ── Player notes count per user ─────────────────────────────────────────────
+    notes_count_by_user: dict[str, int] = {}
+    try:
+        notes_resp = sb.table("player_notes").select("user_id").execute()
+        for row in (notes_resp.data or []):
+            uid = str(row.get("user_id", ""))
+            notes_count_by_user[uid] = notes_count_by_user.get(uid, 0) + 1
+    except Exception:
+        pass
 
-    nil_by_player: dict[str, list] = {}
+    # ── Activity counts per user (prediction_run + player_projection) ───────────
+    prediction_count_by_user: dict[str, int] = {}
+    projection_count_by_user: dict[str, int] = {}
+    try:
+        activity_resp = sb.table("user_activity").select("user_id, event_type").execute()
+        for row in (activity_resp.data or []):
+            uid = str(row.get("user_id", ""))
+            if row.get("event_type") == "prediction_run":
+                prediction_count_by_user[uid] = prediction_count_by_user.get(uid, 0) + 1
+            elif row.get("event_type") == "player_projection":
+                projection_count_by_user[uid] = projection_count_by_user.get(uid, 0) + 1
+    except Exception:
+        pass  # Table may not exist yet — gracefully degrade
+
+    # ── Player name lookup ──────────────────────────────────────────────────────
+    player_name_map: dict[str, str] = {}
+    try:
+        for player in _get_cache("mens") + _get_cache("womens"):
+            player_name_map[player.id] = player.name
+    except Exception:
+        pass
+
+    user_map = {u["id"]: u for u in user_details}
+    scenarios_by_user: dict[str, list] = {}
+
+    nil_by_player: dict[str, dict] = {}
     account_budgets = []
+    user_summaries: dict[str, dict] = {}
 
     for s in scenarios:
         uid = str(s.get("user_id", ""))
@@ -1391,12 +1472,18 @@ def get_analytics(x_analytics_key: str = Header(None)):
         budget = s.get("budget") or 0
         nil_deals: dict = s.get("nil_deals") or {}
 
+        scenarios_by_user.setdefault(uid, []).append(s)
+
         committed = 0
         targeted = 0
+        nil_deal_count = 0
 
         for player_id, deal in nil_deals.items():
             amount = deal.get("offerAmount") or 0
             deal_status = deal.get("status", "not_targeted")
+
+            if deal_status != "not_targeted":
+                nil_deal_count += 1
 
             if deal_status == "signed":
                 committed += amount
@@ -1404,8 +1491,11 @@ def get_analytics(x_analytics_key: str = Header(None)):
                 targeted += amount
 
             if player_id not in nil_by_player:
-                nil_by_player[player_id] = []
-            nil_by_player[player_id].append({
+                nil_by_player[player_id] = {
+                    "player_name": player_name_map.get(player_id, ""),
+                    "entries": [],
+                }
+            nil_by_player[player_id]["entries"].append({
                 "school":   school,
                 "scenario": s.get("name", ""),
                 "amount":   amount,
@@ -1414,7 +1504,10 @@ def get_analytics(x_analytics_key: str = Header(None)):
 
         account_budgets.append({
             "user_id":       uid,
+            "name":          user_info.get("name", ""),
+            "email":         user_info.get("email", ""),
             "school":        school,
+            "team_name":     user_info.get("team_name", ""),
             "scenario_name": s.get("name", ""),
             "budget":        budget,
             "committed":     committed,
@@ -1422,12 +1515,70 @@ def get_analytics(x_analytics_key: str = Header(None)):
             "remaining":     budget - committed - targeted,
         })
 
+        if uid not in user_summaries:
+            user_summaries[uid] = {
+                "scenario_count":   0,
+                "total_budget":     0,
+                "total_committed":  0,
+                "total_targeted":   0,
+                "nil_deal_count":   0,
+                "note_count":       notes_count_by_user.get(uid, 0),
+                "prediction_count": prediction_count_by_user.get(uid, 0),
+                "projection_count": projection_count_by_user.get(uid, 0),
+            }
+        user_summaries[uid]["scenario_count"]  += 1
+        user_summaries[uid]["total_budget"]    += budget
+        user_summaries[uid]["total_committed"] += committed
+        user_summaries[uid]["total_targeted"]  += targeted
+        user_summaries[uid]["nil_deal_count"]  += nil_deal_count
+
+    # Every user has at least 1 roster (the default preset, stored locally only)
+    users_without_scenarios = sum(1 for u in user_details if u["id"] not in scenarios_by_user)
+    roster_count = len(scenarios) + users_without_scenarios
+
+    # Enrich each user with activity summary + scenario list for drill-down
+    for u in user_details:
+        uid = u["id"]
+        u["activity"] = user_summaries.get(uid, {
+            "scenario_count":   0,
+            "total_budget":     0,
+            "total_committed":  0,
+            "total_targeted":   0,
+            "nil_deal_count":   0,
+            "note_count":       notes_count_by_user.get(uid, 0),
+            "prediction_count": prediction_count_by_user.get(uid, 0),
+            "projection_count": projection_count_by_user.get(uid, 0),
+        })
+        u["scenarios"] = [
+            {
+                "id":             s.get("id", ""),
+                "name":           s.get("name", ""),
+                "budget":         s.get("budget") or 0,
+                "nil_deal_count": sum(
+                    1 for d in (s.get("nil_deals") or {}).values()
+                    if d.get("status", "not_targeted") != "not_targeted"
+                ),
+                "committed": sum(
+                    d.get("offerAmount", 0)
+                    for d in (s.get("nil_deals") or {}).values()
+                    if d.get("status") == "signed"
+                ),
+                "targeted": sum(
+                    d.get("offerAmount", 0)
+                    for d in (s.get("nil_deals") or {}).values()
+                    if d.get("status") in ("targeted", "offered", "negotiating")
+                ),
+                "created_at": s.get("created_at", ""),
+            }
+            for s in scenarios_by_user.get(uid, [])
+        ]
+
     return {
-        "user_count":         len(user_details),
-        "roster_count":       len(scenarios),
-        "users_by_school":    dict(sorted(users_by_school.items(), key=lambda x: -x[1])),
+        "user_count":          len(user_details),
+        "roster_count":        roster_count,
+        "users_by_school":     dict(sorted(users_by_school.items(), key=lambda x: -x[1])),
         "users_by_conference": dict(sorted(users_by_conference.items(), key=lambda x: -x[1])),
-        "user_details":       sorted(user_details, key=lambda u: u["created_at"], reverse=True),
-        "nil_by_player":      nil_by_player,
-        "account_budgets":    account_budgets,
+        "user_details":        sorted(user_details, key=lambda u: u["created_at"], reverse=True),
+        "nil_by_player":       nil_by_player,
+        "account_budgets":     account_budgets,
     }
