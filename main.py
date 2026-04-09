@@ -610,7 +610,26 @@ def infer_position(position_id: str, height_in: int) -> str:
       2 = F  (avg 80", forwards — PF or C depending on height)
       3 = G/F (avg 75.5", guards and wings — split by height)
       4 = G  (avg 73", pure guards)
+
+    Women's CSV uses descriptive text labels instead of numeric IDs.
+    These are resolved directly before falling through to the numeric path.
+    Height thresholds for ambiguous labels (Guard/Forward) use women's
+    typical ranges: Guard >= 68" → SG, Forward >= 72" → PF.
     """
+    _womens_text: dict[str, str] = {
+        'point guard':    'PG',
+        'shooting guard': 'SG',
+        'small forward':  'SF',
+        'power forward':  'PF',
+        'center':         'C',
+        'guard':          'SG' if height_in >= 68 else 'PG',
+        'forward':        'PF' if height_in >= 72 else 'SF',
+    }
+    lower = position_id.lower().strip()
+    if lower in _womens_text:
+        return _womens_text[lower]
+
+    # ESPN numeric IDs (men's CSV path — unchanged)
     pid = safe_int(position_id, 3)
     if pid == 1:
         return "C"
@@ -626,12 +645,21 @@ def infer_position(position_id: str, height_in: int) -> str:
         return "SG"
     return "PG"
 
+_WOMENS_EXP: dict[str, int] = {
+    "freshman": 1, "sophomore": 2, "junior": 3, "senior": 4,
+    "graduate": 5, "grad": 5,
+}
+
+def _exp_to_int(exp: str) -> int:
+    """Convert experience string (numeric or text) to integer year (1–5)."""
+    return _WOMENS_EXP.get(exp.lower().strip(), None) or safe_int(exp, 1)
+
 def experience_to_class_year(exp: str) -> str:
-    e = safe_int(exp, 1)
-    return {1: "FR", 2: "SO", 3: "JR", 4: "SR"}.get(e, "SR")
+    e = _exp_to_int(exp)
+    return {1: "FR", 2: "SO", 3: "JR", 4: "SR", 5: "GRAD"}.get(e, "SR")
 
 def eligibility_remaining(exp: str) -> int:
-    e = safe_int(exp, 1)
+    e = _exp_to_int(exp)
     return max(1, 5 - e)
 
 def compute_efg_pct(fgm: float, fg3m: float, fga: float) -> float:
@@ -1004,7 +1032,11 @@ def _run_prediction(player_id: str, projected_mpg: float, raw: dict) -> Predicti
         fg2_pct=round(pred.get("next_offensive_two_point_field_goal_pct", 0.0), 4),
         ft_made=round(pred.get("next_offensive_avg_free_throws_made", 0.0), 2),
         ft_attempted=round(pred.get("next_offensive_avg_free_throws_attempted", 0.0), 2),
-        ft_pct=round(pred.get("next_offensive_free_throws", 0.0), 4),
+        ft_pct=round(
+            pred.get("next_offensive_avg_free_throws_made", 0.0) /
+            pred.get("next_offensive_avg_free_throws_attempted", 0.0) * 100,
+            1
+        ) if pred.get("next_offensive_avg_free_throws_attempted", 0.0) > 0 else 0.0,
         # Playmaking
         assists=round(pred.get("next_offensive_avg_assists", 0.0), 2),
         turnovers=round(pred.get("next_offensive_avg_turnovers", 0.0), 2),
